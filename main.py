@@ -163,8 +163,12 @@ class QueryResponse(BaseModel):
     channels: List[ChannelReading]
     totalAvailableBandwidth: float
     location: Location
-    queryTime: str
+    queryTime: datetime = Field(default_factory=datetime.utcnow)
 
+    class Config:
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
 # Database connection
 client = None
@@ -658,37 +662,37 @@ async def query_tvws(query: QueryRequest):
         "state": query.state,
         "name": query.location
     })
-
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
 
-    # Find the most recent measurement for this location
+    # Find measurements
     measurement = await database.measurements.find_one(
-        {
-            "state": query.state,
-            "location": query.location,
-            "timestamp": {"$lte": query.time}
-        },
+        {"state": query.state, "location": query.location},
         sort=[("timestamp", -1)]
     )
 
     if not measurement:
-        raise HTTPException(
-            status_code=404,
-            detail="No measurements found for this location and time"
+        return QueryResponse(
+            channels=[ChannelReading(
+                channel=0,
+                frequency_mhz=0,
+                signal_strength_dbm=0,
+                status="occupied"
+            )],
+            totalAvailableBandwidth=0,
+            location=location,
+            queryTime=datetime.utcnow().isoformat()
         )
 
-    # Calculate total available bandwidth
+    # Process readings
     free_channels = [ch for ch in measurement["readings"] if ch["status"] == "free"]
-    total_bandwidth = len(free_channels) * 8  # 8 MHz per channel
 
     return QueryResponse(
         channels=measurement["readings"],
-        totalAvailableBandwidth=total_bandwidth,
-        location=Location(**location),
+        totalAvailableBandwidth=len(free_channels) * 8,
+        location=location,
         queryTime=query.time.isoformat()
     )
-
 
 if __name__ == "__main__":
     import uvicorn
