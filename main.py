@@ -21,6 +21,7 @@ from collections import defaultdict
 load_dotenv()
 
 # TV White Space frequency bands (typical for Nigeria)
+# Channel number -> center frequency in MHz
 TVWS_CHANNELS = {
     # VHF Low Band (channels 2-6)
     2: 54, 3: 61, 4: 68, 5: 79, 6: 88,
@@ -36,20 +37,79 @@ TVWS_CHANNELS = {
     50: 686, 51: 692
 }
 
-# Channel to frequency mapping (in MHz)
+# Each TV channel is 8 MHz wide; center ± 4 MHz defines the channel boundary.
+# Readings from the RF Explorer are spaced ~0.9 MHz apart, so multiple sub-channel
+# readings fall within one 8 MHz TV channel.  We bin them and aggregate.
+CHANNEL_HALF_BW_MHZ = 4.0
+
+# Signal threshold for TVWS availability (ITU / NCC Nigeria guidelines)
+TVWS_FREE_THRESHOLD_DBM = -97.0
+
+
 def get_channel_from_frequency(freq_mhz: float) -> int:
-    """Convert frequency to TV channel number"""
-    for channel, freq in TVWS_CHANNELS.items():
-        # Allow +/- 6 MHz tolerance for channel detection
-        if abs(freq - freq_mhz) <= 6:
+    """
+    Return the TV channel number whose 8 MHz slot contains freq_mhz.
+    Returns 0 if the frequency does not fall in any defined TVWS channel.
+    """
+    for channel, center in TVWS_CHANNELS.items():
+        if abs(center - freq_mhz) <= CHANNEL_HALF_BW_MHZ:
             return channel
-    return 0  # Not a TVWS channel
+    return 0
+
 
 def get_tvws_frequencies() -> List[float]:
-    """Get list of TVWS center frequencies"""
+    """Return the list of TVWS channel center frequencies (MHz)."""
     return list(TVWS_CHANNELS.values())
 
+
+def aggregate_readings_to_channels(
+    raw_readings: List[Dict]
+) -> List[Dict]:
+    """
+    Aggregate multiple sub-channel RF readings into per-TV-channel summaries.
+
+    The RF Explorer sweeps at ~0.9 MHz steps, so each 8 MHz TV channel contains
+    roughly 8-9 individual readings.  We:
+      1. Bin each reading into its TV channel.
+      2. Take the *maximum* power within the channel (worst-case occupancy).
+      3. Mark the channel 'occupied' if max power >= TVWS_FREE_THRESHOLD_DBM,
+         else 'free'.
+
+    Args:
+        raw_readings: list of dicts with keys
+            {channel, frequency_mhz, signal_strength_dbm}
+
+    Returns:
+        List of dicts (one per channel) sorted by channel number.
+    """
+    channel_buckets: Dict[int, List[float]] = defaultdict(list)
+    channel_center: Dict[int, float] = {}
+
+    for r in raw_readings:
+        ch = r["channel"]
+        if ch == 0:
+            continue  # skip readings that didn't map to a channel
+        channel_buckets[ch].append(r["signal_strength_dbm"])
+        channel_center[ch] = TVWS_CHANNELS.get(ch, r["frequency_mhz"])
+
+    aggregated = []
+    for ch in sorted(channel_buckets.keys()):
+        powers = channel_buckets[ch]
+        max_power = max(powers)
+        aggregated.append({
+            "channel": ch,
+            "frequency_mhz": channel_center[ch],
+            "signal_strength_dbm": round(max_power, 2),
+            "status": "free" if max_power < TVWS_FREE_THRESHOLD_DBM else "occupied",
+        })
+
+    return aggregated
+
+
+# ---------------------------------------------------------------------------
 # Pydantic models
+# ---------------------------------------------------------------------------
+
 def validate_object_id(v: Any) -> str:
     if isinstance(v, ObjectId):
         return str(v)
@@ -160,7 +220,7 @@ class Measurement(MongoBaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     source_file: Optional[str] = None
     file_segment: Optional[int] = None
-    rbhz_khz: Optional[float] = None
+    rbw_khz: Optional[float] = None
 
 class MeasurementCreate(BaseModel):
     state: str
@@ -169,25 +229,13 @@ class MeasurementCreate(BaseModel):
     readings: List[ChannelReading]
     source_file: Optional[str] = None
     file_segment: Optional[int] = None
-    rbhz_khz: Optional[float] = None
+    rbw_khz: Optional[float] = None
 
 class MeasurementUpdate(BaseModel):
     state: Optional[str] = None
     location: Optional[str] = None
     timestamp: Optional[datetime] = None
     readings: Optional[List[ChannelReading]] = None
-
-class CSVMeasurementRow(BaseModel):
-    frequency_mhz: float
-    power_dbm: float
-    in_tvws_band: str
-    file_segment: int
-    location_name: str
-    gps_latitude: float
-    gps_longitude: float
-    timestamp_utc: datetime
-    rbhz_khz: float
-    source_file: str
 
 class QueryRequest(BaseModel):
     state: str
@@ -201,41 +249,47 @@ class QueryResponse(BaseModel):
     queryTime: datetime = Field(default_factory=datetime.utcnow)
 
     class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat()
-        }
+        json_encoders = {datetime: lambda v: v.isoformat()}
 
 class CSVUploadResponse(BaseModel):
     message: str
     measurements_created: int
+    measurements_skipped: int
     location_created: bool
     state_created: bool
     file_name: str
     rows_processed: int
+    tvws_rows_processed: int
+    segments_found: List[int]
 
+
+# ---------------------------------------------------------------------------
 # Database connection
+# ---------------------------------------------------------------------------
+
 client = None
 database = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     global client, database
     mongodb_url = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     client = AsyncIOMotorClient(mongodb_url)
     database = client[os.getenv("MONGODB_DB", "tvws_db")]
 
-    # Create indexes
     await database.users.create_index("email", unique=True)
     await database.states.create_index("name", unique=True)
     await database.locations.create_index([("state", 1), ("name", 1)], unique=True)
     await database.measurements.create_index([("state", 1), ("location", 1), ("timestamp", -1)])
-    await database.measurements.create_index([("location_name", 1), ("timestamp", -1)])
+    # Unique index per (location, timestamp, file_segment) to prevent duplicates
+    await database.measurements.create_index(
+        [("location", 1), ("timestamp", 1), ("file_segment", 1)],
+        unique=True,
+        sparse=True,
+    )
 
-    # Create default admin user if not exists
     admin_email = os.getenv("ADMIN_EMAIL", "admin@tvws.ng")
     admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
-
     admin_user = await database.users.find_one({"email": admin_email})
     if not admin_user:
         password_hash = bcrypt.hashpw(admin_password.encode('utf-8'), bcrypt.gensalt())
@@ -249,9 +303,8 @@ async def lifespan(app: FastAPI):
         })
 
     yield
-
-    # Shutdown
     client.close()
+
 
 app = FastAPI(
     title="TVWS Geolocation API",
@@ -260,7 +313,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -287,50 +339,36 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if "user_id" not in payload:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token payload"
-            )
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
         return payload
     except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.PyJWTError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired",
+                            headers={"WWW-Authenticate": "Bearer"})
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials",
+                            headers={"WWW-Authenticate": "Bearer"})
 
 async def get_current_user(token_data: dict = Depends(verify_token)):
     user = await database.users.find_one({"_id": ObjectId(token_data["user_id"])})
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
 
 async def get_admin_user(current_user: dict = Depends(get_current_user)):
     if current_user["role"] != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return current_user
 
-# Authentication endpoints
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/auth/register", response_model=UserResponse)
 async def register(user_data: UserCreate):
     existing_user = await database.users.find_one({"email": user_data.email})
     if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Email already registered"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
 
     password_hash = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt())
     user_data_dict = user_data.model_dump(exclude={"password"})
@@ -346,55 +384,42 @@ async def register(user_data: UserCreate):
 async def login(user_data: UserLogin):
     user = await database.users.find_one({"email": user_data.email})
     if not user or not bcrypt.checkpw(user_data.password.encode('utf-8'), user["password_hash"].encode('utf-8')):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials",
+                            headers={"WWW-Authenticate": "Bearer"})
 
     access_token_expires = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    token_data = {
-        "user_id": str(user["_id"]),
-        "exp": access_token_expires
-    }
+    token_data = {"user_id": str(user["_id"]), "exp": access_token_expires}
     token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
 
     return {
         "access_token": token,
         "token_type": "bearer",
         "expires_at": access_token_expires.isoformat(),
-        "user": {
-            "id": str(user["_id"]),
-            "email": user["email"],
-            "role": user["role"],
-            "name": user["name"]
-        }
+        "user": {"id": str(user["_id"]), "email": user["email"], "role": user["role"], "name": user["name"]}
     }
 
 @app.get("/auth/me", response_model=UserResponse)
 async def get_me(current_user: dict = Depends(get_current_user)):
     try:
         return UserResponse.from_mongo(current_user)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not retrieve user information",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Could not retrieve user information",
+                            headers={"WWW-Authenticate": "Bearer"})
 
+
+# ---------------------------------------------------------------------------
 # Users endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/users", response_model=List[UserResponse])
 async def get_users(admin_user: dict = Depends(get_admin_user)):
-    users = []
-    async for user in database.users.find():
-        users.append(UserResponse.from_mongo(user))
-    return users
+    return [UserResponse.from_mongo(u) async for u in database.users.find()]
 
 @app.get("/users/{user_id}", response_model=UserResponse)
 async def get_user(user_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status_code=400, detail="Invalid user ID")
-
     user = await database.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -404,63 +429,50 @@ async def get_user(user_id: str, admin_user: dict = Depends(get_admin_user)):
 async def update_user(user_id: str, user_data: UserUpdate, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status_code=400, detail="Invalid user ID")
-
     user = await database.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     update_data = user_data.model_dump(exclude_unset=True)
     if "password" in update_data:
-        password_hash = bcrypt.hashpw(update_data["password"].encode('utf-8'), bcrypt.gensalt())
-        update_data["password_hash"] = password_hash.decode('utf-8')
-        del update_data["password"]
-
+        update_data["password_hash"] = bcrypt.hashpw(
+            update_data.pop("password").encode('utf-8'), bcrypt.gensalt()
+        ).decode('utf-8')
     update_data["updated_at"] = datetime.utcnow()
 
-    await database.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$set": update_data}
-    )
-    updated_user = await database.users.find_one({"_id": ObjectId(user_id)})
-    return UserResponse.from_mongo(updated_user)
+    await database.users.update_one({"_id": ObjectId(user_id)}, {"$set": update_data})
+    return UserResponse.from_mongo(await database.users.find_one({"_id": ObjectId(user_id)}))
 
 @app.delete("/users/{user_id}")
 async def delete_user(user_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status_code=400, detail="Invalid user ID")
-
     result = await database.users.delete_one({"_id": ObjectId(user_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     return {"message": "User deleted successfully"}
 
+
+# ---------------------------------------------------------------------------
 # States endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/states", response_model=List[State])
 async def get_states():
-    states = []
-    async for state in database.states.find():
-        states.append(State(**state))
-    return states
+    return [State(**s) async for s in database.states.find()]
 
 @app.post("/states", response_model=State)
 async def create_state(state: StateCreate, admin_user: dict = Depends(get_admin_user)):
-    existing = await database.states.find_one({"name": state.name})
-    if existing:
+    if await database.states.find_one({"name": state.name}):
         raise HTTPException(status_code=400, detail="State already exists")
-
-    state_data = state.model_dump()
-    state_data["created_at"] = datetime.utcnow()
-    state_data["updated_at"] = datetime.utcnow()
-
+    state_data = {**state.model_dump(), "created_at": datetime.utcnow(), "updated_at": datetime.utcnow()}
     result = await database.states.insert_one(state_data)
-    new_state = await database.states.find_one({"_id": result.inserted_id})
-    return State.from_mongo(new_state)
+    return State.from_mongo(await database.states.find_one({"_id": result.inserted_id}))
 
 @app.get("/states/{state_id}", response_model=State)
 async def get_state(state_id: str):
     if not ObjectId.is_valid(state_id):
         raise HTTPException(status_code=400, detail="Invalid state ID")
-
     state = await database.states.find_one({"_id": ObjectId(state_id)})
     if not state:
         raise HTTPException(status_code=404, detail="State not found")
@@ -470,294 +482,356 @@ async def get_state(state_id: str):
 async def update_state(state_id: str, state_data: StateUpdate, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(state_id):
         raise HTTPException(status_code=400, detail="Invalid state ID")
-
-    state = await database.states.find_one({"_id": ObjectId(state_id)})
-    if not state:
+    if not await database.states.find_one({"_id": ObjectId(state_id)}):
         raise HTTPException(status_code=404, detail="State not found")
-
-    update_data = state_data.model_dump(exclude_unset=True)
-    update_data["updated_at"] = datetime.utcnow()
-
-    await database.states.update_one(
-        {"_id": ObjectId(state_id)},
-        {"$set": update_data}
-    )
-    updated_state = await database.states.find_one({"_id": ObjectId(state_id)})
-    return State(**updated_state)
+    update_data = {**state_data.model_dump(exclude_unset=True), "updated_at": datetime.utcnow()}
+    await database.states.update_one({"_id": ObjectId(state_id)}, {"$set": update_data})
+    return State(**await database.states.find_one({"_id": ObjectId(state_id)}))
 
 @app.delete("/states/{state_id}")
 async def delete_state(state_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(state_id):
         raise HTTPException(status_code=400, detail="Invalid state ID")
-
-    locations_count = await database.locations.count_documents({"state": state_id})
-    if locations_count > 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot delete state with associated locations"
-        )
-
+    if await database.locations.count_documents({"state": state_id}) > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete state with associated locations")
     result = await database.states.delete_one({"_id": ObjectId(state_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="State not found")
     return {"message": "State deleted successfully"}
 
+
+# ---------------------------------------------------------------------------
 # Locations endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/locations", response_model=List[Location])
 async def get_locations():
-    locations = []
-    async for location in database.locations.find():
-        locations.append(Location(**location))
-    return locations
+    return [Location(**loc) async for loc in database.locations.find()]
 
 @app.get("/locations/state/{state}", response_model=List[Location])
 async def get_locations_by_state(state: str):
-    locations = []
-    async for location in database.locations.find({"state": state}):
-        locations.append(Location(**location))
-    return locations
+    return [Location(**loc) async for loc in database.locations.find({"state": state})]
 
 @app.post("/locations", response_model=Location)
 async def create_location(location: LocationCreate, admin_user: dict = Depends(get_admin_user)):
-    existing = await database.locations.find_one({
-        "state": location.state,
-        "name": location.name
-    })
-    if existing:
+    if await database.locations.find_one({"state": location.state, "name": location.name}):
         raise HTTPException(status_code=400, detail="Location already exists")
-
-    location_data = location.model_dump()
-    location_data["created_at"] = datetime.utcnow()
-    location_data["updated_at"] = datetime.utcnow()
-
+    location_data = {**location.model_dump(), "created_at": datetime.utcnow(), "updated_at": datetime.utcnow()}
     result = await database.locations.insert_one(location_data)
-    new_location = await database.locations.find_one({"_id": result.inserted_id})
-    return Location.from_mongo(new_location)
+    return Location.from_mongo(await database.locations.find_one({"_id": result.inserted_id}))
 
 @app.get("/locations/id/{location_id}", response_model=Location)
 async def get_location_by_id(location_id: str):
     if not ObjectId.is_valid(location_id):
         raise HTTPException(status_code=400, detail="Invalid location ID")
-
     location = await database.locations.find_one({"_id": ObjectId(location_id)})
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
     return Location.from_mongo(location)
 
 @app.put("/locations/{location_id}", response_model=Location)
-async def update_location(location_id: str, location_data: LocationUpdate, admin_user: dict = Depends(get_admin_user)):
+async def update_location(location_id: str, location_data: LocationUpdate,
+                           admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(location_id):
         raise HTTPException(status_code=400, detail="Invalid location ID")
-
-    location = await database.locations.find_one({"_id": ObjectId(location_id)})
-    if not location:
+    if not await database.locations.find_one({"_id": ObjectId(location_id)}):
         raise HTTPException(status_code=404, detail="Location not found")
-
-    update_data = location_data.model_dump(exclude_unset=True)
-    update_data["updated_at"] = datetime.utcnow()
-
-    await database.locations.update_one(
-        {"_id": ObjectId(location_id)},
-        {"$set": update_data}
-    )
-    updated_location = await database.locations.find_one({"_id": ObjectId(location_id)})
-    return Location(**updated_location)
+    update_data = {**location_data.model_dump(exclude_unset=True), "updated_at": datetime.utcnow()}
+    await database.locations.update_one({"_id": ObjectId(location_id)}, {"$set": update_data})
+    return Location(**await database.locations.find_one({"_id": ObjectId(location_id)}))
 
 @app.delete("/locations/{location_id}")
 async def delete_location(location_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(location_id):
         raise HTTPException(status_code=400, detail="Invalid location ID")
-
-    measurements_count = await database.measurements.count_documents({"location": location_id})
-    if measurements_count > 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot delete location with associated measurements"
-        )
-
+    if await database.measurements.count_documents({"location": location_id}) > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete location with associated measurements")
     result = await database.locations.delete_one({"_id": ObjectId(location_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Location not found")
     return {"message": "Location deleted successfully"}
 
-# CSV Upload endpoint
+
+# ---------------------------------------------------------------------------
+# CSV Upload  ── rewritten to handle RF Explorer sweep data correctly
+# ---------------------------------------------------------------------------
+
+# State name lookup by location name prefix (extend as needed).
+# If a location name is not found here the upload request must supply it via
+# the optional `state_name` query parameter, or it falls back to "Unknown".
+LOCATION_STATE_MAP: Dict[str, str] = {
+    "Umuahia": "Abia",
+    "Aba":     "Abia",
+    "Enugu":   "Enugu",
+    "Awka":    "Anambra",
+    "Owerri":  "Imo",
+}
+
+def infer_state(location_name: str) -> str:
+    """Best-effort state lookup from the location name prefix."""
+    for prefix, state in LOCATION_STATE_MAP.items():
+        if location_name.startswith(prefix):
+            return state
+    return "Unknown"
+
+
 @app.post("/upload-csv", response_model=CSVUploadResponse)
 async def upload_tvws_csv(
     file: UploadFile = File(...),
-    admin_user: dict = Depends(get_admin_user)
+    state_name: Optional[str] = None,           # caller can supply the state explicitly
+    admin_user: dict = Depends(get_admin_user),
 ):
-    """Upload a CSV file containing RF Explorer spectrum measurements"""
-    
-    if not file.filename.endswith('.csv'):
+    """
+    Upload a CSV file produced by the RF Explorer spectrum analyser.
+
+    Expected columns (from preprocessing pipeline):
+        Frequency_MHz, Power_dBm, In_TVWS_Band, File_Segment,
+        Location_Name, GPS_Latitude, GPS_Longitude,
+        Timestamp_UTC, RBW_kHz, Source_File
+
+    Processing logic
+    ----------------
+    Each unique (Location_Name, Timestamp_UTC, File_Segment) triplet
+    becomes **one Measurement document**.  This preserves individual sweeps
+    and avoids collapsing all 25 segments into a single illegible record.
+
+    Only rows where In_TVWS_Band == 'YES' are kept as channel readings.
+    Within each segment the ~0.9 MHz spaced readings are binned into their
+    parent 8 MHz TV channel; the **maximum power** within that bin is used
+    (worst-case occupancy).  A channel is marked 'free' when max power is
+    below TVWS_FREE_THRESHOLD_DBM (-97 dBm).
+    """
+    if not file.filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted")
-    
+
     content = await file.read()
-    text_content = content.decode('utf-8')
-    
-    # Parse CSV
+    try:
+        text_content = content.decode('utf-8')
+    except UnicodeDecodeError:
+        text_content = content.decode('latin-1')
+
     csv_reader = csv.DictReader(io.StringIO(text_content))
-    
-    # Group measurements by location and timestamp
-    measurements_by_location = defaultdict(lambda: defaultdict(list))
-    rows_processed = 0
-    location_info = {}
-    
+
+    # Validate that the required columns are present
+    required_columns = {
+        "Frequency_MHz", "Power_dBm", "In_TVWS_Band", "File_Segment",
+        "Location_Name", "GPS_Latitude", "GPS_Longitude",
+        "Timestamp_UTC", "RBW_kHz", "Source_File",
+    }
+    first_row = None
+    rows = []
     for row in csv_reader:
+        if first_row is None:
+            first_row = row
+            missing = required_columns - set(row.keys())
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"CSV is missing required columns: {', '.join(sorted(missing))}"
+                )
+        rows.append(row)
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
+
+    # ------------------------------------------------------------------
+    # Pass 1: group raw rows by (location_name, timestamp, file_segment)
+    # Only TVWS rows are kept for channel readings.
+    # ------------------------------------------------------------------
+    # Structure: segments[location][timestamp_iso][segment_int] = {meta, raw_readings[]}
+    segments: Dict[str, Dict[str, Dict[int, Dict]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(lambda: {"meta": None, "raw": []}))
+    )
+
+    rows_processed = 0
+    tvws_rows_processed = 0
+    parse_errors = 0
+
+    for row in rows:
         rows_processed += 1
         try:
-            freq_mhz = float(row['Frequency_MHz'])
-            power_dbm = float(row['Power_dBm'])
-            in_tvws = row['In_TVWS_Band']
-            file_segment = int(row['File_Segment'])
-            location_name = row['Location_Name']
-            gps_lat = float(row['GPS_Latitude'])
-            gps_lon = float(row['GPS_Longitude'])
-            timestamp = datetime.fromisoformat(row['Timestamp_UTC'].replace('Z', '+00:00'))
-            rbhz_khz = float(row['RBW_kHz'])
-            source_file = row['Source_File']
-            
-            # Store location info
-            location_info[location_name] = {
-                'lat': gps_lat,
-                'lon': gps_lon,
-                'state': admin_user.get('location_state', 'Unknown')  # You may want to add state mapping
-            }
-            
-            # Only process TVWS frequencies
-            if in_tvws == 'YES' or (in_tvws == 'NO' and freq_mhz in get_tvws_frequencies()):
-                # Determine channel number
-                channel = get_channel_from_frequency(freq_mhz)
-                
-                # Determine status based on power level
-                # Typical threshold for TVWS: -97 dBm
-                status = "free" if power_dbm < -97 else "occupied"
-                
-                measurements_by_location[location_name][timestamp.isoformat()].append({
-                    "channel": channel,
-                    "frequency_mhz": freq_mhz,
-                    "signal_strength_dbm": power_dbm,
-                    "status": status
-                })
-        except (ValueError, KeyError) as e:
-            print(f"Error parsing row: {e}")
+            freq_mhz    = float(row["Frequency_MHz"])
+            power_dbm   = float(row["Power_dBm"])
+            in_tvws     = row["In_TVWS_Band"].strip().upper()
+            segment     = int(row["File_Segment"])
+            loc_name    = row["Location_Name"].strip()
+            gps_lat     = float(row["GPS_Latitude"])
+            gps_lon     = float(row["GPS_Longitude"])
+            rbw_khz     = float(row["RBW_kHz"])
+            source_file = row["Source_File"].strip()
+            timestamp   = datetime.fromisoformat(
+                row["Timestamp_UTC"].replace("Z", "+00:00")
+            ).replace(tzinfo=None)   # store as naive UTC in MongoDB
+        except (ValueError, KeyError) as exc:
+            parse_errors += 1
             continue
-    
-    # Create or get state and location, then store measurements
-    measurements_created = 0
-    location_created = False
-    state_created = False
-    
-    for location_name, timestamps in measurements_by_location.items():
-        # Get or create state (default to "Abia" for Umuahia based on your data)
-        state_name = location_info.get(location_name, {}).get('state', 'Abia')
-        
-        # Check if state exists
-        state = await database.states.find_one({"name": state_name})
-        if not state:
-            state_data = {
-                "name": state_name,
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow()
+
+        ts_iso = timestamp.isoformat()
+        bucket = segments[loc_name][ts_iso][segment]
+
+        # Store metadata once per bucket (all rows in a segment share it)
+        if bucket["meta"] is None:
+            bucket["meta"] = {
+                "gps_lat":     gps_lat,
+                "gps_lon":     gps_lon,
+                "rbw_khz":     rbw_khz,
+                "source_file": source_file,
+                "timestamp":   timestamp,
+                "location":    loc_name,
             }
-            result = await database.states.insert_one(state_data)
-            state = await database.states.find_one({"_id": result.inserted_id})
-            state_created = True
-        
-        # Get or create location
-        location = await database.locations.find_one({
-            "state": state_name,
-            "name": location_name
+
+        # Only keep TVWS readings
+        if in_tvws != "YES":
+            continue
+
+        channel = get_channel_from_frequency(freq_mhz)
+        if channel == 0:
+            # Frequency is marked TVWS but doesn't map to a known channel — skip
+            continue
+
+        tvws_rows_processed += 1
+        bucket["raw"].append({
+            "channel":            channel,
+            "frequency_mhz":      freq_mhz,
+            "signal_strength_dbm": power_dbm,
         })
-        
-        if not location:
-            location_data = {
-                "state": state_name,
-                "name": location_name,
-                "coordinates": {
-                    "lat": location_info[location_name]['lat'],
-                    "lon": location_info[location_name]['lon']
-                },
+
+    # ------------------------------------------------------------------
+    # Pass 2: upsert state / location / measurement documents
+    # ------------------------------------------------------------------
+    measurements_created = 0
+    measurements_skipped = 0
+    location_created     = False
+    state_created        = False
+    segments_found: List[int] = []
+
+    for loc_name, ts_map in segments.items():
+        resolved_state = state_name or infer_state(loc_name)
+
+        # ---- ensure State exists ----
+        if not await database.states.find_one({"name": resolved_state}):
+            await database.states.insert_one({
+                "name":       resolved_state,
                 "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow()
-            }
-            result = await database.locations.insert_one(location_data)
-            location = await database.locations.find_one({"_id": result.inserted_id})
-            location_created = True
-        
-        # Store measurements for each timestamp
-        for timestamp_str, readings in timestamps.items():
-            # Sort readings by frequency
-            readings.sort(key=lambda x: x['frequency_mhz'])
-            
-            measurement_data = {
-                "state": state_name,
-                "location": location_name,
-                "timestamp": datetime.fromisoformat(timestamp_str),
-                "readings": readings,
-                "created_at": datetime.utcnow(),
-                "source_file": file.filename,
-                "rbhz_khz": rbhz_khz
-            }
-            
-            # Check if measurement already exists for this location and timestamp
-            existing = await database.measurements.find_one({
-                "location": location_name,
-                "timestamp": measurement_data["timestamp"]
+                "updated_at": datetime.utcnow(),
             })
-            
-            if not existing:
-                await database.measurements.insert_one(measurement_data)
+            state_created = True
+
+        for ts_iso, seg_map in ts_map.items():
+            # Collect GPS from the first segment that has metadata
+            any_meta = next(
+                (v["meta"] for v in seg_map.values() if v["meta"]), None
+            )
+            if any_meta is None:
+                continue
+
+            # ---- ensure Location exists ----
+            existing_loc = await database.locations.find_one(
+                {"state": resolved_state, "name": loc_name}
+            )
+            if not existing_loc:
+                loc_result = await database.locations.insert_one({
+                    "state": resolved_state,
+                    "name":  loc_name,
+                    "coordinates": {
+                        "lat": any_meta["gps_lat"],
+                        "lon": any_meta["gps_lon"],
+                    },
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                })
+                location_created = True
+
+            # ---- one Measurement per segment ----
+            for segment, bucket in seg_map.items():
+                if segment not in segments_found:
+                    segments_found.append(segment)
+
+                meta = bucket["meta"]
+                if meta is None:
+                    continue
+
+                # Skip segments with no TVWS readings (e.g. VHF-only sweeps)
+                if not bucket["raw"]:
+                    continue
+
+                # Aggregate sub-channel readings → one entry per TV channel
+                channel_readings = aggregate_readings_to_channels(bucket["raw"])
+
+                # Deduplicate: skip if this (location, timestamp, segment) already exists
+                existing_meas = await database.measurements.find_one({
+                    "location":     loc_name,
+                    "timestamp":    meta["timestamp"],
+                    "file_segment": segment,
+                })
+                if existing_meas:
+                    measurements_skipped += 1
+                    continue
+
+                await database.measurements.insert_one({
+                    "state":        resolved_state,
+                    "location":     loc_name,
+                    "timestamp":    meta["timestamp"],
+                    "readings":     channel_readings,
+                    "created_at":   datetime.utcnow(),
+                    "source_file":  meta["source_file"],
+                    "file_segment": segment,
+                    "rbw_khz":      meta["rbw_khz"],
+                })
                 measurements_created += 1
-    
+
     return CSVUploadResponse(
-        message="CSV file processed successfully",
+        message="CSV file processed successfully" + (
+            f" ({parse_errors} rows skipped due to parse errors)" if parse_errors else ""
+        ),
         measurements_created=measurements_created,
+        measurements_skipped=measurements_skipped,
         location_created=location_created,
         state_created=state_created,
         file_name=file.filename,
-        rows_processed=rows_processed
+        rows_processed=rows_processed,
+        tvws_rows_processed=tvws_rows_processed,
+        segments_found=sorted(segments_found),
     )
 
+
+# ---------------------------------------------------------------------------
 # Measurements endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/measurements", response_model=List[Measurement])
 async def get_measurements(admin_user: dict = Depends(get_admin_user)):
-    measurements = []
-    async for measurement in database.measurements.find():
-        measurements.append(Measurement(**measurement))
-    return measurements
+    return [Measurement(**m) async for m in database.measurements.find()]
 
 @app.post("/measurements", response_model=Measurement)
 async def upload_measurements(measurement: MeasurementCreate, admin_user: dict = Depends(get_admin_user)):
-    processed_readings = []
-    for reading in measurement.readings:
-        status = "free" if reading.signal_strength_dbm < -97 else "occupied"
-        processed_readings.append({
-            "channel": reading.channel,
-            "frequency_mhz": reading.frequency_mhz,
-            "signal_strength_dbm": reading.signal_strength_dbm,
-            "status": status
-        })
+    processed_readings = [
+        {
+            "channel":            r.channel,
+            "frequency_mhz":      r.frequency_mhz,
+            "signal_strength_dbm": r.signal_strength_dbm,
+            "status":             "free" if r.signal_strength_dbm < TVWS_FREE_THRESHOLD_DBM else "occupied",
+        }
+        for r in measurement.readings
+    ]
 
     measurement_data = {
-        "state": measurement.state,
-        "location": measurement.location,
-        "timestamp": measurement.timestamp,
-        "readings": processed_readings,
-        "created_at": datetime.utcnow(),
-        "source_file": measurement.source_file,
+        "state":        measurement.state,
+        "location":     measurement.location,
+        "timestamp":    measurement.timestamp,
+        "readings":     processed_readings,
+        "created_at":   datetime.utcnow(),
+        "source_file":  measurement.source_file,
         "file_segment": measurement.file_segment,
-        "rbhz_khz": measurement.rbhz_khz
+        "rbw_khz":      measurement.rbw_khz,
     }
-
     result = await database.measurements.insert_one(measurement_data)
-    new_measurement = await database.measurements.find_one({"_id": result.inserted_id})
-    return Measurement.from_mongo(new_measurement)
+    return Measurement.from_mongo(await database.measurements.find_one({"_id": result.inserted_id}))
 
 @app.get("/measurements/{measurement_id}", response_model=Measurement)
 async def get_measurement(measurement_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(measurement_id):
         raise HTTPException(status_code=400, detail="Invalid measurement ID")
-
     measurement = await database.measurements.find_one({"_id": ObjectId(measurement_id)})
     if not measurement:
         raise HTTPException(status_code=404, detail="Measurement not found")
@@ -775,8 +849,8 @@ async def get_all_measurements(
     """Get all measurements with pagination"""
     measurements = []
     cursor = database.measurements.find().sort("timestamp", -1).skip(skip).limit(limit)
-    async for measurement in cursor:
-        measurements.append(Measurement.from_mongo(measurement))
+    async for m in cursor:
+        measurements.append(Measurement.from_mongo(m))
     return measurements
 
 
@@ -791,11 +865,9 @@ async def get_measurements_by_location_name(
     query = {"location": location_name}
     if state:
         query["state"] = state
-    
     measurements = []
-    cursor = database.measurements.find(query).sort("timestamp", -1).limit(limit)
-    async for measurement in cursor:
-        measurements.append(Measurement.from_mongo(measurement))
+    async for m in database.measurements.find(query).sort("timestamp", -1).limit(limit):
+        measurements.append(Measurement.from_mongo(m))
     return measurements
 
 
@@ -807,9 +879,8 @@ async def get_measurements_by_state(
 ):
     """Get all measurements for a specific state"""
     measurements = []
-    cursor = database.measurements.find({"state": state_name}).sort("timestamp", -1).limit(limit)
-    async for measurement in cursor:
-        measurements.append(Measurement.from_mongo(measurement))
+    async for m in database.measurements.find({"state": state_name}).sort("timestamp", -1).limit(limit):
+        measurements.append(Measurement.from_mongo(m))
     return measurements
 
 
@@ -822,99 +893,99 @@ async def get_measurements_by_location_id(
     """Get measurements by location ID"""
     if not ObjectId.is_valid(location_id):
         raise HTTPException(status_code=400, detail="Invalid location ID")
-    
-    # Get location to find its name
     location = await database.locations.find_one({"_id": ObjectId(location_id)})
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
-    
     measurements = []
-    cursor = database.measurements.find({
-        "location": location["name"],
-        "state": location["state"]
-    }).sort("timestamp", -1).limit(limit)
-    
-    async for measurement in cursor:
-        measurements.append(Measurement.from_mongo(measurement))
+    async for m in database.measurements.find(
+        {"location": location["name"], "state": location["state"]}
+    ).sort("timestamp", -1).limit(limit):
+        measurements.append(Measurement.from_mongo(m))
     return measurements
 
 
 @app.get("/measurements/latest/{location_name}", response_model=Optional[Measurement])
-async def get_latest_measurement(
-    location_name: str,
-    state: Optional[str] = None
-):
-    """Get the latest measurement for a location (public endpoint)"""
+async def get_latest_measurement(location_name: str, state: Optional[str] = None):
+    """
+    Get the latest merged TVWS measurement for a location (public endpoint).
+
+    When a location has multiple segments, this endpoint returns a synthetic
+    'merged' measurement that combines the channel readings from all segments
+    at the most recent timestamp, giving a full picture of spectrum occupancy.
+    """
     query = {"location": location_name}
     if state:
         query["state"] = state
-    
-    measurement = await database.measurements.find_one(
-        query,
-        sort=[("timestamp", -1)]
-    )
-    
-    if not measurement:
+
+    # Find the latest timestamp for this location
+    latest = await database.measurements.find_one(query, sort=[("timestamp", -1)])
+    if not latest:
         raise HTTPException(status_code=404, detail="No measurements found for this location")
-    
-    return Measurement.from_mongo(measurement)
+
+    latest_ts = latest["timestamp"]
+
+    # Collect all segments at that timestamp
+    all_readings: Dict[int, Dict] = {}
+    async for m in database.measurements.find(
+        {**query, "timestamp": latest_ts}
+    ):
+        for reading in m["readings"]:
+            ch = reading["channel"]
+            # If channel appears in multiple segments, keep the worst-case (highest power)
+            if ch not in all_readings or reading["signal_strength_dbm"] > all_readings[ch]["signal_strength_dbm"]:
+                all_readings[ch] = reading
+
+    merged = latest.copy()
+    merged["readings"] = sorted(all_readings.values(), key=lambda r: r["channel"])
+    merged["file_segment"] = None   # merged across segments
+
+    return Measurement.from_mongo(merged)
 
 
 @app.get("/measurements/summary/{state_name}", response_model=Dict)
-async def get_state_summary(
-    state_name: str,
-    admin_user: dict = Depends(get_admin_user)
-):
+async def get_state_summary(state_name: str, admin_user: dict = Depends(get_admin_user)):
     """Get summary statistics for a state"""
-    
-    # Get all measurements for the state
-    measurements_cursor = database.measurements.find({"state": state_name})
-    
-    total_measurements = 0
-    unique_locations = set()
-    total_free_channels = 0
-    total_occupied_channels = 0
-    channel_stats = defaultdict(lambda: {"free": 0, "occupied": 0, "total": 0})
-    
-    async for measurement in measurements_cursor:
+    total_measurements   = 0
+    unique_locations     = set()
+    total_free_channels  = 0
+    total_occupied       = 0
+    channel_stats        = defaultdict(lambda: {"free": 0, "occupied": 0, "total": 0})
+
+    async for m in database.measurements.find({"state": state_name}):
         total_measurements += 1
-        unique_locations.add(measurement["location"])
-        
-        for reading in measurement["readings"]:
-            channel = reading.get("channel", 0)
+        unique_locations.add(m["location"])
+        for reading in m["readings"]:
+            ch     = reading.get("channel", 0)
             status = reading.get("status", "unknown")
-            
+            channel_stats[ch]["total"] += 1
             if status == "free":
                 total_free_channels += 1
-                channel_stats[channel]["free"] += 1
+                channel_stats[ch]["free"] += 1
             elif status == "occupied":
-                total_occupied_channels += 1
-                channel_stats[channel]["occupied"] += 1
-            
-            channel_stats[channel]["total"] += 1
-    
-    # Get locations in the state
+                total_occupied += 1
+                channel_stats[ch]["occupied"] += 1
+
     locations = []
-    async for location in database.locations.find({"state": state_name}):
+    async for loc in database.locations.find({"state": state_name}):
         locations.append({
-            "id": str(location["_id"]),
-            "name": location["name"],
-            "coordinates": location["coordinates"]
+            "id":          str(loc["_id"]),
+            "name":        loc["name"],
+            "coordinates": loc["coordinates"],
         })
-    
+
     return {
-        "state": state_name,
+        "state":              state_name,
         "total_measurements": total_measurements,
-        "unique_locations": len(unique_locations),
-        "locations": locations,
-        "channel_statistics": {
-            str(ch): stats for ch, stats in channel_stats.items()
-        },
+        "unique_locations":   len(unique_locations),
+        "locations":          locations,
+        "channel_statistics": {str(ch): stats for ch, stats in channel_stats.items()},
         "summary": {
-            "total_free_channel_readings": total_free_channels,
-            "total_occupied_channel_readings": total_occupied_channels,
-            "average_free_per_measurement": total_free_channels / total_measurements if total_measurements > 0 else 0
-        }
+            "total_free_channel_readings":     total_free_channels,
+            "total_occupied_channel_readings": total_occupied,
+            "average_free_per_measurement":    (
+                total_free_channels / total_measurements if total_measurements else 0
+            ),
+        },
     }
 
 
@@ -928,25 +999,20 @@ async def get_measurements_by_date_range(
 ):
     """Get measurements within a date range"""
     try:
-        start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-        end = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+        start = datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=None)
+        end   = datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=None)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format (YYYY-MM-DDTHH:MM:SSZ)")
-    
-    query = {
-        "timestamp": {"$gte": start, "$lte": end}
-    }
-    
+
+    query: Dict = {"timestamp": {"$gte": start, "$lte": end}}
     if state:
         query["state"] = state
     if location:
         query["location"] = location
-    
+
     measurements = []
-    cursor = database.measurements.find(query).sort("timestamp", -1)
-    async for measurement in cursor:
-        measurements.append(Measurement.from_mongo(measurement))
-    
+    async for m in database.measurements.find(query).sort("timestamp", -1):
+        measurements.append(Measurement.from_mongo(m))
     return measurements
 
 
@@ -956,43 +1022,38 @@ async def get_free_channels_stats(
     location: Optional[str] = None,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get statistics about free channels"""
-    
-    query = {}
+    """Get statistics about free channels across measurements"""
+    query: Dict = {}
     if state:
         query["state"] = state
     if location:
         query["location"] = location
-    
-    # Aggregation pipeline
+
     pipeline = [
         {"$match": query},
         {"$unwind": "$readings"},
         {"$match": {"readings.status": "free"}},
         {"$group": {
-            "_id": {
-                "channel": "$readings.channel",
-                "frequency": "$readings.frequency_mhz"
-            },
-            "count": {"$sum": 1},
-            "avg_signal": {"$avg": "$readings.signal_strength_dbm"}
+            "_id":        {"channel": "$readings.channel", "frequency": "$readings.frequency_mhz"},
+            "count":      {"$sum": 1},
+            "avg_signal": {"$avg": "$readings.signal_strength_dbm"},
         }},
-        {"$sort": {"_id.channel": 1}}
+        {"$sort": {"_id.channel": 1}},
     ]
-    
+
     results = []
     async for doc in database.measurements.aggregate(pipeline):
         results.append({
-            "channel": doc["_id"]["channel"],
-            "frequency_mhz": doc["_id"]["frequency"],
-            "times_free": doc["count"],
-            "average_signal_dbm": round(doc["avg_signal"], 2)
+            "channel":          doc["_id"]["channel"],
+            "frequency_mhz":    doc["_id"]["frequency"],
+            "times_free":       doc["count"],
+            "average_signal_dbm": round(doc["avg_signal"], 2),
         })
-    
+
     return {
         "total_free_channel_occurrences": sum(r["times_free"] for r in results),
-        "unique_free_channels": len(results),
-        "channels": results
+        "unique_free_channels":           len(results),
+        "channels":                       results,
     }
 
 
@@ -1003,166 +1064,164 @@ async def export_measurements(
     format: str = "json",
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Export measurements for a location in various formats"""
-    
+    """Export measurements for a location in JSON or CSV format"""
     query = {"location": location_name}
     if state:
         query["state"] = state
-    
+
     measurements = []
-    cursor = database.measurements.find(query).sort("timestamp", -1)
-    async for measurement in cursor:
+    async for m in database.measurements.find(query).sort("timestamp", -1):
         measurements.append({
-            "id": str(measurement["_id"]),
-            "state": measurement["state"],
-            "location": measurement["location"],
-            "timestamp": measurement["timestamp"].isoformat(),
-            "readings": measurement["readings"],
-            "created_at": measurement.get("created_at", measurement["timestamp"]).isoformat()
+            "id":           str(m["_id"]),
+            "state":        m["state"],
+            "location":     m["location"],
+            "timestamp":    m["timestamp"].isoformat(),
+            "file_segment": m.get("file_segment"),
+            "rbw_khz":      m.get("rbw_khz"),
+            "readings":     m["readings"],
+            "created_at":   m.get("created_at", m["timestamp"]).isoformat(),
         })
-    
+
     if format == "csv":
-        # Generate CSV string
-        import csv
-        from io import StringIO
-        
-        output = StringIO()
+        output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Measurement ID", "State", "Location", "Timestamp", "Channel", "Frequency (MHz)", "Signal (dBm)", "Status"])
-        
+        writer.writerow([
+            "Measurement ID", "State", "Location", "Timestamp",
+            "File_Segment", "RBW_kHz",
+            "Channel", "Frequency_MHz", "Signal_dBm", "Status",
+        ])
         for m in measurements:
             for reading in m["readings"]:
                 writer.writerow([
-                    m["id"],
-                    m["state"],
-                    m["location"],
-                    m["timestamp"],
-                    reading["channel"],
-                    reading["frequency_mhz"],
-                    reading["signal_strength_dbm"],
-                    reading["status"]
+                    m["id"], m["state"], m["location"], m["timestamp"],
+                    m["file_segment"], m["rbw_khz"],
+                    reading["channel"], reading["frequency_mhz"],
+                    reading["signal_strength_dbm"], reading["status"],
                 ])
-        
         return {"csv_data": output.getvalue()}
-    
+
     return {
-        "location": location_name,
-        "state": state or "all",
+        "location":          location_name,
+        "state":             state or "all",
         "total_measurements": len(measurements),
-        "measurements": measurements
+        "measurements":      measurements,
     }
+
 
 @app.put("/measurements/{measurement_id}", response_model=Measurement)
 async def update_measurement(
-        measurement_id: str,
-        measurement_data: MeasurementUpdate,
-        admin_user: dict = Depends(get_admin_user)
+    measurement_id: str,
+    measurement_data: MeasurementUpdate,
+    admin_user: dict = Depends(get_admin_user)
 ):
     if not ObjectId.is_valid(measurement_id):
         raise HTTPException(status_code=400, detail="Invalid measurement ID")
-
-    measurement = await database.measurements.find_one({"_id": ObjectId(measurement_id)})
-    if not measurement:
+    if not await database.measurements.find_one({"_id": ObjectId(measurement_id)}):
         raise HTTPException(status_code=404, detail="Measurement not found")
 
     update_data = measurement_data.model_dump(exclude_unset=True)
-
     if "readings" in update_data:
-        processed_readings = []
-        for reading in update_data["readings"]:
-            status = "free" if reading["signal_strength_dbm"] < -97 else "occupied"
-            processed_readings.append({
-                "channel": reading["channel"],
-                "frequency_mhz": reading["frequency_mhz"],
-                "signal_strength_dbm": reading["signal_strength_dbm"],
-                "status": status
-            })
-        update_data["readings"] = processed_readings
+        update_data["readings"] = [
+            {
+                "channel":            r["channel"],
+                "frequency_mhz":      r["frequency_mhz"],
+                "signal_strength_dbm": r["signal_strength_dbm"],
+                "status":             "free" if r["signal_strength_dbm"] < TVWS_FREE_THRESHOLD_DBM else "occupied",
+            }
+            for r in update_data["readings"]
+        ]
 
-    await database.measurements.update_one(
-        {"_id": ObjectId(measurement_id)},
-        {"$set": update_data}
-    )
-    updated_measurement = await database.measurements.find_one({"_id": ObjectId(measurement_id)})
-    return Measurement(**updated_measurement)
+    await database.measurements.update_one({"_id": ObjectId(measurement_id)}, {"$set": update_data})
+    return Measurement(**await database.measurements.find_one({"_id": ObjectId(measurement_id)}))
+
 
 @app.delete("/measurements/{measurement_id}")
 async def delete_measurement(measurement_id: str, admin_user: dict = Depends(get_admin_user)):
     if not ObjectId.is_valid(measurement_id):
         raise HTTPException(status_code=400, detail="Invalid measurement ID")
-
     result = await database.measurements.delete_one({"_id": ObjectId(measurement_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Measurement not found")
     return {"message": "Measurement deleted successfully"}
 
+
+# ---------------------------------------------------------------------------
 # TVWS Query endpoint
+# ---------------------------------------------------------------------------
+
 @app.post("/query-tvws", response_model=QueryResponse)
 async def query_tvws(query: QueryRequest):
-    """Query TVWS database for channel availability at a specific location and time"""
-    
-    # Find location
-    location = await database.locations.find_one({
-        "state": query.state,
-        "name": query.location
-    })
+    """
+    Query TVWS channel availability at a specific location and time.
+
+    Returns a merged view across all segments recorded at or before the
+    requested time, giving a complete channel availability picture.
+    """
+    location = await database.locations.find_one({"state": query.state, "name": query.location})
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
 
-    # Find most recent measurement before the query time
-    measurement = await database.measurements.find_one(
-        {
-            "state": query.state,
-            "location": query.location,
-            "timestamp": {"$lte": query.time}
-        },
+    # Find the latest timestamp at or before query time
+    latest = await database.measurements.find_one(
+        {"state": query.state, "location": query.location, "timestamp": {"$lte": query.time}},
         sort=[("timestamp", -1)]
     )
 
-    if not measurement:
-        # Return all channels as unknown if no data available
-        tvws_frequencies = get_tvws_frequencies()
-        channels = []
-        for freq in tvws_frequencies:
-            channel_num = get_channel_from_frequency(freq)
-            channels.append(ChannelReading(
-                channel=channel_num,
-                frequency_mhz=freq,
-                signal_strength_dbm=0,
+    if not latest:
+        # No data — return all channels as unknown
+        channels = [
+            ChannelReading(
+                channel=ch,
+                frequency_mhz=float(freq),
+                signal_strength_dbm=0.0,
                 status="unknown"
-            ))
-        
+            )
+            for ch, freq in TVWS_CHANNELS.items()
+        ]
         return QueryResponse(
             channels=channels,
-            totalAvailableBandwidth=0,
+            totalAvailableBandwidth=0.0,
             location=Location(**location),
             queryTime=query.time
         )
 
-    # Process readings
-    free_channels = [ch for ch in measurement["readings"] if ch["status"] == "free"]
+    latest_ts = latest["timestamp"]
+
+    # Merge all segments at that timestamp (worst-case per channel)
+    merged: Dict[int, Dict] = {}
+    async for m in database.measurements.find(
+        {"state": query.state, "location": query.location, "timestamp": latest_ts}
+    ):
+        for reading in m["readings"]:
+            ch = reading["channel"]
+            if ch not in merged or reading["signal_strength_dbm"] > merged[ch]["signal_strength_dbm"]:
+                merged[ch] = reading
+
+    channel_list = sorted(merged.values(), key=lambda r: r["channel"])
+    free_count   = sum(1 for r in channel_list if r.get("status") == "free")
 
     return QueryResponse(
-        channels=measurement["readings"],
-        totalAvailableBandwidth=len(free_channels) * 8,
+        channels=channel_list,
+        totalAvailableBandwidth=float(free_count * 8),   # 8 MHz per channel
         location=Location(**location),
         queryTime=query.time
     )
 
-# Additional endpoint for getting all TVWS channel definitions
+
+# ---------------------------------------------------------------------------
+# Utility endpoints
+# ---------------------------------------------------------------------------
+
 @app.get("/tvws-channels")
 async def get_tvws_channels():
-    """Get list of all TVWS channels with their center frequencies"""
+    """List all defined TVWS channels with their center frequencies."""
     return {
-        "channels": [
-            {"channel": ch, "frequency_mhz": freq}
-            for ch, freq in TVWS_CHANNELS.items()
-        ],
+        "channels":      [{"channel": ch, "frequency_mhz": freq} for ch, freq in TVWS_CHANNELS.items()],
         "bandwidth_mhz": 8,
-        "total_channels": len(TVWS_CHANNELS)
+        "total_channels": len(TVWS_CHANNELS),
     }
 
-# Endpoint to get measurements by location
+
 @app.get("/measurements/location/{state}/{location}")
 async def get_measurements_by_location(
     state: str,
@@ -1170,13 +1229,14 @@ async def get_measurements_by_location(
     limit: int = 10,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get all measurements for a specific location"""
+    """Get measurements for a specific state/location combination."""
     measurements = []
-    async for measurement in database.measurements.find(
+    async for m in database.measurements.find(
         {"state": state, "location": location}
     ).sort("timestamp", -1).limit(limit):
-        measurements.append(Measurement.from_mongo(measurement))
+        measurements.append(Measurement.from_mongo(m))
     return measurements
+
 
 if __name__ == "__main__":
     import uvicorn
