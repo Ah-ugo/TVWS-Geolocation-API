@@ -763,6 +763,295 @@ async def get_measurement(measurement_id: str, admin_user: dict = Depends(get_ad
         raise HTTPException(status_code=404, detail="Measurement not found")
     return Measurement.from_mongo(measurement)
 
+
+# Additional Measurement GET endpoints
+
+@app.get("/measurements/all", response_model=List[Measurement])
+async def get_all_measurements(
+    skip: int = 0,
+    limit: int = 100,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get all measurements with pagination"""
+    measurements = []
+    cursor = database.measurements.find().sort("timestamp", -1).skip(skip).limit(limit)
+    async for measurement in cursor:
+        measurements.append(Measurement.from_mongo(measurement))
+    return measurements
+
+
+@app.get("/measurements/by-location/{location_name}", response_model=List[Measurement])
+async def get_measurements_by_location_name(
+    location_name: str,
+    state: Optional[str] = None,
+    limit: int = 50,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get measurements by location name, optionally filtered by state"""
+    query = {"location": location_name}
+    if state:
+        query["state"] = state
+    
+    measurements = []
+    cursor = database.measurements.find(query).sort("timestamp", -1).limit(limit)
+    async for measurement in cursor:
+        measurements.append(Measurement.from_mongo(measurement))
+    return measurements
+
+
+@app.get("/measurements/by-state/{state_name}", response_model=List[Measurement])
+async def get_measurements_by_state(
+    state_name: str,
+    limit: int = 100,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get all measurements for a specific state"""
+    measurements = []
+    cursor = database.measurements.find({"state": state_name}).sort("timestamp", -1).limit(limit)
+    async for measurement in cursor:
+        measurements.append(Measurement.from_mongo(measurement))
+    return measurements
+
+
+@app.get("/measurements/by-location-id/{location_id}", response_model=List[Measurement])
+async def get_measurements_by_location_id(
+    location_id: str,
+    limit: int = 50,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get measurements by location ID"""
+    if not ObjectId.is_valid(location_id):
+        raise HTTPException(status_code=400, detail="Invalid location ID")
+    
+    # Get location to find its name
+    location = await database.locations.find_one({"_id": ObjectId(location_id)})
+    if not location:
+        raise HTTPException(status_code=404, detail="Location not found")
+    
+    measurements = []
+    cursor = database.measurements.find({
+        "location": location["name"],
+        "state": location["state"]
+    }).sort("timestamp", -1).limit(limit)
+    
+    async for measurement in cursor:
+        measurements.append(Measurement.from_mongo(measurement))
+    return measurements
+
+
+@app.get("/measurements/latest/{location_name}", response_model=Optional[Measurement])
+async def get_latest_measurement(
+    location_name: str,
+    state: Optional[str] = None
+):
+    """Get the latest measurement for a location (public endpoint)"""
+    query = {"location": location_name}
+    if state:
+        query["state"] = state
+    
+    measurement = await database.measurements.find_one(
+        query,
+        sort=[("timestamp", -1)]
+    )
+    
+    if not measurement:
+        raise HTTPException(status_code=404, detail="No measurements found for this location")
+    
+    return Measurement.from_mongo(measurement)
+
+
+@app.get("/measurements/summary/{state_name}", response_model=Dict)
+async def get_state_summary(
+    state_name: str,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get summary statistics for a state"""
+    
+    # Get all measurements for the state
+    measurements_cursor = database.measurements.find({"state": state_name})
+    
+    total_measurements = 0
+    unique_locations = set()
+    total_free_channels = 0
+    total_occupied_channels = 0
+    channel_stats = defaultdict(lambda: {"free": 0, "occupied": 0, "total": 0})
+    
+    async for measurement in measurements_cursor:
+        total_measurements += 1
+        unique_locations.add(measurement["location"])
+        
+        for reading in measurement["readings"]:
+            channel = reading.get("channel", 0)
+            status = reading.get("status", "unknown")
+            
+            if status == "free":
+                total_free_channels += 1
+                channel_stats[channel]["free"] += 1
+            elif status == "occupied":
+                total_occupied_channels += 1
+                channel_stats[channel]["occupied"] += 1
+            
+            channel_stats[channel]["total"] += 1
+    
+    # Get locations in the state
+    locations = []
+    async for location in database.locations.find({"state": state_name}):
+        locations.append({
+            "id": str(location["_id"]),
+            "name": location["name"],
+            "coordinates": location["coordinates"]
+        })
+    
+    return {
+        "state": state_name,
+        "total_measurements": total_measurements,
+        "unique_locations": len(unique_locations),
+        "locations": locations,
+        "channel_statistics": {
+            str(ch): stats for ch, stats in channel_stats.items()
+        },
+        "summary": {
+            "total_free_channel_readings": total_free_channels,
+            "total_occupied_channel_readings": total_occupied_channels,
+            "average_free_per_measurement": total_free_channels / total_measurements if total_measurements > 0 else 0
+        }
+    }
+
+
+@app.get("/measurements/date-range", response_model=List[Measurement])
+async def get_measurements_by_date_range(
+    start_date: str,
+    end_date: str,
+    state: Optional[str] = None,
+    location: Optional[str] = None,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get measurements within a date range"""
+    try:
+        start = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+        end = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format (YYYY-MM-DDTHH:MM:SSZ)")
+    
+    query = {
+        "timestamp": {"$gte": start, "$lte": end}
+    }
+    
+    if state:
+        query["state"] = state
+    if location:
+        query["location"] = location
+    
+    measurements = []
+    cursor = database.measurements.find(query).sort("timestamp", -1)
+    async for measurement in cursor:
+        measurements.append(Measurement.from_mongo(measurement))
+    
+    return measurements
+
+
+@app.get("/measurements/stats/free-channels", response_model=Dict)
+async def get_free_channels_stats(
+    state: Optional[str] = None,
+    location: Optional[str] = None,
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Get statistics about free channels"""
+    
+    query = {}
+    if state:
+        query["state"] = state
+    if location:
+        query["location"] = location
+    
+    # Aggregation pipeline
+    pipeline = [
+        {"$match": query},
+        {"$unwind": "$readings"},
+        {"$match": {"readings.status": "free"}},
+        {"$group": {
+            "_id": {
+                "channel": "$readings.channel",
+                "frequency": "$readings.frequency_mhz"
+            },
+            "count": {"$sum": 1},
+            "avg_signal": {"$avg": "$readings.signal_strength_dbm"}
+        }},
+        {"$sort": {"_id.channel": 1}}
+    ]
+    
+    results = []
+    async for doc in database.measurements.aggregate(pipeline):
+        results.append({
+            "channel": doc["_id"]["channel"],
+            "frequency_mhz": doc["_id"]["frequency"],
+            "times_free": doc["count"],
+            "average_signal_dbm": round(doc["avg_signal"], 2)
+        })
+    
+    return {
+        "total_free_channel_occurrences": sum(r["times_free"] for r in results),
+        "unique_free_channels": len(results),
+        "channels": results
+    }
+
+
+@app.get("/measurements/export/{location_name}", response_model=Dict)
+async def export_measurements(
+    location_name: str,
+    state: Optional[str] = None,
+    format: str = "json",
+    admin_user: dict = Depends(get_admin_user)
+):
+    """Export measurements for a location in various formats"""
+    
+    query = {"location": location_name}
+    if state:
+        query["state"] = state
+    
+    measurements = []
+    cursor = database.measurements.find(query).sort("timestamp", -1)
+    async for measurement in cursor:
+        measurements.append({
+            "id": str(measurement["_id"]),
+            "state": measurement["state"],
+            "location": measurement["location"],
+            "timestamp": measurement["timestamp"].isoformat(),
+            "readings": measurement["readings"],
+            "created_at": measurement.get("created_at", measurement["timestamp"]).isoformat()
+        })
+    
+    if format == "csv":
+        # Generate CSV string
+        import csv
+        from io import StringIO
+        
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Measurement ID", "State", "Location", "Timestamp", "Channel", "Frequency (MHz)", "Signal (dBm)", "Status"])
+        
+        for m in measurements:
+            for reading in m["readings"]:
+                writer.writerow([
+                    m["id"],
+                    m["state"],
+                    m["location"],
+                    m["timestamp"],
+                    reading["channel"],
+                    reading["frequency_mhz"],
+                    reading["signal_strength_dbm"],
+                    reading["status"]
+                ])
+        
+        return {"csv_data": output.getvalue()}
+    
+    return {
+        "location": location_name,
+        "state": state or "all",
+        "total_measurements": len(measurements),
+        "measurements": measurements
+    }
+
 @app.put("/measurements/{measurement_id}", response_model=Measurement)
 async def update_measurement(
         measurement_id: str,
