@@ -553,7 +553,7 @@ async def delete_location(location_id: str, admin_user: dict = Depends(get_admin
 
 
 # ---------------------------------------------------------------------------
-# CSV Upload  ── rewritten to handle RF Explorer sweep data correctly
+# CSV Upload - FIXED to accept all frequencies
 # ---------------------------------------------------------------------------
 
 # State name lookup by location name prefix (extend as needed).
@@ -584,6 +584,10 @@ async def upload_tvws_csv(
     """
     Upload a CSV file produced by the RF Explorer spectrum analyser.
 
+    FIX: Accepts ALL frequencies regardless of In_TVWS_Band value.
+    Frequencies are automatically mapped to TV channels based on the
+    TVWS_CHANNELS definition. Frequencies outside defined channels are skipped.
+
     Expected columns (from preprocessing pipeline):
         Frequency_MHz, Power_dBm, In_TVWS_Band, File_Segment,
         Location_Name, GPS_Latitude, GPS_Longitude,
@@ -592,14 +596,13 @@ async def upload_tvws_csv(
     Processing logic
     ----------------
     Each unique (Location_Name, Timestamp_UTC, File_Segment) triplet
-    becomes **one Measurement document**.  This preserves individual sweeps
-    and avoids collapsing all 25 segments into a single illegible record.
+    becomes **one Measurement document**. This preserves individual sweeps.
 
-    Only rows where In_TVWS_Band == 'YES' are kept as channel readings.
-    Within each segment the ~0.9 MHz spaced readings are binned into their
-    parent 8 MHz TV channel; the **maximum power** within that bin is used
-    (worst-case occupancy).  A channel is marked 'free' when max power is
-    below TVWS_FREE_THRESHOLD_DBM (-97 dBm).
+    ALL rows are processed as potential TVWS readings. Each frequency is
+    mapped to its parent TV channel (if any). Within each segment the ~0.9 MHz
+    spaced readings are binned into their parent 8 MHz TV channel; the
+    **maximum power** within that bin is used (worst-case occupancy).
+    A channel is marked 'free' when max power is below TVWS_FREE_THRESHOLD_DBM (-97 dBm).
     """
     if not file.filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted")
@@ -614,10 +617,11 @@ async def upload_tvws_csv(
 
     # Validate that the required columns are present
     required_columns = {
-        "Frequency_MHz", "Power_dBm", "In_TVWS_Band", "File_Segment",
+        "Frequency_MHz", "Power_dBm", "File_Segment",
         "Location_Name", "GPS_Latitude", "GPS_Longitude",
         "Timestamp_UTC", "RBW_kHz", "Source_File",
     }
+    # In_TVWS_Band is optional now - we ignore it
     first_row = None
     rows = []
     for row in csv_reader:
@@ -636,7 +640,7 @@ async def upload_tvws_csv(
 
     # ------------------------------------------------------------------
     # Pass 1: group raw rows by (location_name, timestamp, file_segment)
-    # Only TVWS rows are kept for channel readings.
+    # Process ALL rows - ignore In_TVWS_Band column
     # ------------------------------------------------------------------
     # Structure: segments[location][timestamp_iso][segment_int] = {meta, raw_readings[]}
     segments: Dict[str, Dict[str, Dict[int, Dict]]] = defaultdict(
@@ -646,13 +650,13 @@ async def upload_tvws_csv(
     rows_processed = 0
     tvws_rows_processed = 0
     parse_errors = 0
+    frequencies_outside_band = 0
 
     for row in rows:
         rows_processed += 1
         try:
             freq_mhz    = float(row["Frequency_MHz"])
             power_dbm   = float(row["Power_dBm"])
-            in_tvws     = row["In_TVWS_Band"].strip().upper()
             segment     = int(row["File_Segment"])
             loc_name    = row["Location_Name"].strip()
             gps_lat     = float(row["GPS_Latitude"])
@@ -680,13 +684,10 @@ async def upload_tvws_csv(
                 "location":    loc_name,
             }
 
-        # Only keep TVWS readings
-        if in_tvws != "YES":
-            continue
-
+        # Map frequency to TV channel (skip if outside defined TV bands)
         channel = get_channel_from_frequency(freq_mhz)
         if channel == 0:
-            # Frequency is marked TVWS but doesn't map to a known channel — skip
+            frequencies_outside_band += 1
             continue
 
         tvws_rows_processed += 1
@@ -751,7 +752,7 @@ async def upload_tvws_csv(
                 if meta is None:
                     continue
 
-                # Skip segments with no TVWS readings (e.g. VHF-only sweeps)
+                # Skip segments with no TVWS readings (all frequencies outside TV band)
                 if not bucket["raw"]:
                     continue
 
@@ -780,10 +781,15 @@ async def upload_tvws_csv(
                 })
                 measurements_created += 1
 
+    # Build message with details about skipped frequencies
+    message = f"CSV file processed successfully"
+    if parse_errors:
+        message += f" ({parse_errors} rows skipped due to parse errors)"
+    if frequencies_outside_band:
+        message += f" ({frequencies_outside_band} frequencies outside TV band were skipped)"
+
     return CSVUploadResponse(
-        message="CSV file processed successfully" + (
-            f" ({parse_errors} rows skipped due to parse errors)" if parse_errors else ""
-        ),
+        message=message,
         measurements_created=measurements_created,
         measurements_skipped=measurements_skipped,
         location_created=location_created,
