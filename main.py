@@ -16,12 +16,13 @@ from typing_extensions import TypedDict
 import csv
 import io
 from collections import defaultdict
+import math
 
 # Load environment variables
 load_dotenv()
 
-# TV White Space frequency bands (typical for Nigeria)
-# Channel number -> center frequency in MHz
+# TV White Space frequency bands - WILL BE DYNAMICALLY EXPANDED
+# Start with standard channels but we'll add any frequency as a new channel
 TVWS_CHANNELS = {
     # VHF Low Band (channels 2-6)
     2: 54, 3: 61, 4: 68, 5: 79, 6: 88,
@@ -37,28 +38,50 @@ TVWS_CHANNELS = {
     50: 686, 51: 692
 }
 
+# We'll dynamically add new channels here during upload
+DYNAMIC_CHANNELS = {}
+
 # Each TV channel is 8 MHz wide; center ± 4 MHz defines the channel boundary.
-# Readings from the RF Explorer are spaced ~0.9 MHz apart, so multiple sub-channel
-# readings fall within one 8 MHz TV channel.  We bin them and aggregate.
 CHANNEL_HALF_BW_MHZ = 4.0
 
-# Signal threshold for TVWS availability (ITU / NCC Nigeria guidelines)
+# Signal threshold for TVWS availability
 TVWS_FREE_THRESHOLD_DBM = -97.0
 
+# Counter for creating new channel numbers
+NEXT_CHANNEL_NUM = 52  # Start after standard channels
 
-def get_channel_from_frequency(freq_mhz: float) -> int:
+def get_or_create_channel(freq_mhz: float) -> int:
     """
-    Return the TV channel number whose 8 MHz slot contains freq_mhz.
-    Returns 0 if the frequency does not fall in any defined TVWS channel.
+    Get existing TV channel or create a new one for any frequency.
+    This ensures EVERY frequency gets mapped to a channel.
     """
+    global NEXT_CHANNEL_NUM, TVWS_CHANNELS, DYNAMIC_CHANNELS
+    
+    # First check if frequency is within 0.5 MHz of an existing channel
     for channel, center in TVWS_CHANNELS.items():
         if abs(center - freq_mhz) <= CHANNEL_HALF_BW_MHZ:
             return channel
-    return 0
+    
+    # Check dynamic channels (created in this session)
+    for channel, center in DYNAMIC_CHANNELS.items():
+        if abs(center - freq_mhz) <= CHANNEL_HALF_BW_MHZ:
+            return channel
+    
+    # Create a new channel for this frequency
+    new_channel = NEXT_CHANNEL_NUM
+    NEXT_CHANNEL_NUM += 1
+    
+    # Round frequency to 3 decimal places for consistency
+    rounded_freq = round(freq_mhz, 3)
+    
+    DYNAMIC_CHANNELS[new_channel] = rounded_freq
+    TVWS_CHANNELS[new_channel] = rounded_freq  # Add to main dict for this session
+    
+    return new_channel
 
 
 def get_tvws_frequencies() -> List[float]:
-    """Return the list of TVWS channel center frequencies (MHz)."""
+    """Return the list of all TVWS channel center frequencies."""
     return list(TVWS_CHANNELS.values())
 
 
@@ -66,29 +89,19 @@ def aggregate_readings_to_channels(
     raw_readings: List[Dict]
 ) -> List[Dict]:
     """
-    Aggregate multiple sub-channel RF readings into per-TV-channel summaries.
-
-    The RF Explorer sweeps at ~0.9 MHz steps, so each 8 MHz TV channel contains
-    roughly 8-9 individual readings.  We:
-      1. Bin each reading into its TV channel.
-      2. Take the *maximum* power within the channel (worst-case occupancy).
-      3. Mark the channel 'occupied' if max power >= TVWS_FREE_THRESHOLD_DBM,
-         else 'free'.
-
-    Args:
-        raw_readings: list of dicts with keys
-            {channel, frequency_mhz, signal_strength_dbm}
-
-    Returns:
-        List of dicts (one per channel) sorted by channel number.
+    Aggregate multiple sub-channel RF readings into per-channel summaries.
+    
+    Now handles dynamic channels by grouping frequencies that are close together.
+    Two frequencies are considered the same channel if within CHANNEL_HALF_BW_MHZ (4 MHz).
     """
+    # Group readings by channel (already assigned by get_or_create_channel)
     channel_buckets: Dict[int, List[float]] = defaultdict(list)
     channel_center: Dict[int, float] = {}
 
     for r in raw_readings:
         ch = r["channel"]
         if ch == 0:
-            continue  # skip readings that didn't map to a channel
+            continue
         channel_buckets[ch].append(r["signal_strength_dbm"])
         channel_center[ch] = TVWS_CHANNELS.get(ch, r["frequency_mhz"])
 
@@ -98,7 +111,7 @@ def aggregate_readings_to_channels(
         max_power = max(powers)
         aggregated.append({
             "channel": ch,
-            "frequency_mhz": channel_center[ch],
+            "frequency_mhz": round(channel_center[ch], 3),
             "signal_strength_dbm": round(max_power, 2),
             "status": "free" if max_power < TVWS_FREE_THRESHOLD_DBM else "occupied",
         })
@@ -107,7 +120,7 @@ def aggregate_readings_to_channels(
 
 
 # ---------------------------------------------------------------------------
-# Pydantic models
+# Pydantic models (same as before)
 # ---------------------------------------------------------------------------
 
 def validate_object_id(v: Any) -> str:
@@ -261,6 +274,7 @@ class CSVUploadResponse(BaseModel):
     rows_processed: int
     tvws_rows_processed: int
     segments_found: List[int]
+    dynamic_channels_created: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +295,6 @@ async def lifespan(app: FastAPI):
     await database.states.create_index("name", unique=True)
     await database.locations.create_index([("state", 1), ("name", 1)], unique=True)
     await database.measurements.create_index([("state", 1), ("location", 1), ("timestamp", -1)])
-    # Unique index per (location, timestamp, file_segment) to prevent duplicates
     await database.measurements.create_index(
         [("location", 1), ("timestamp", 1), ("file_segment", 1)],
         unique=True,
@@ -307,9 +320,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TVWS Geolocation API",
-    description="API for managing TV White Space measurements and queries",
-    version="1.0.0",
+    title="TVWS Geolocation API (ALL FREQUENCIES ACCEPTED)",
+    description="API for managing spectrum measurements - accepts ANY frequency",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -361,7 +374,7 @@ async def get_admin_user(current_user: dict = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Auth endpoints
+# Auth endpoints (same as before)
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/register", response_model=UserResponse)
@@ -553,14 +566,12 @@ async def delete_location(location_id: str, admin_user: dict = Depends(get_admin
 
 
 # ---------------------------------------------------------------------------
-# CSV Upload - FIXED to accept all frequencies
+# CSV Upload - ACCEPTS ANY FREQUENCY, creates dynamic channels
 # ---------------------------------------------------------------------------
 
-# State name lookup by location name prefix (extend as needed).
-# If a location name is not found here the upload request must supply it via
-# the optional `state_name` query parameter, or it falls back to "Unknown".
 LOCATION_STATE_MAP: Dict[str, str] = {
     "Umuahia": "Abia",
+    "Umuahia2": "Abia",
     "Aba":     "Abia",
     "Enugu":   "Enugu",
     "Awka":    "Anambra",
@@ -578,32 +589,21 @@ def infer_state(location_name: str) -> str:
 @app.post("/upload-csv", response_model=CSVUploadResponse)
 async def upload_tvws_csv(
     file: UploadFile = File(...),
-    state_name: Optional[str] = None,           # caller can supply the state explicitly
+    state_name: Optional[str] = None,
     admin_user: dict = Depends(get_admin_user),
 ):
     """
-    Upload a CSV file produced by the RF Explorer spectrum analyser.
-
-    FIX: Accepts ALL frequencies regardless of In_TVWS_Band value.
-    Frequencies are automatically mapped to TV channels based on the
-    TVWS_CHANNELS definition. Frequencies outside defined channels are skipped.
-
-    Expected columns (from preprocessing pipeline):
-        Frequency_MHz, Power_dBm, In_TVWS_Band, File_Segment,
-        Location_Name, GPS_Latitude, GPS_Longitude,
-        Timestamp_UTC, RBW_kHz, Source_File
-
-    Processing logic
-    ----------------
-    Each unique (Location_Name, Timestamp_UTC, File_Segment) triplet
-    becomes **one Measurement document**. This preserves individual sweeps.
-
-    ALL rows are processed as potential TVWS readings. Each frequency is
-    mapped to its parent TV channel (if any). Within each segment the ~0.9 MHz
-    spaced readings are binned into their parent 8 MHz TV channel; the
-    **maximum power** within that bin is used (worst-case occupancy).
-    A channel is marked 'free' when max power is below TVWS_FREE_THRESHOLD_DBM (-97 dBm).
+    Upload a CSV file - NOW ACCEPTS ANY FREQUENCY!
+    
+    Every frequency will be mapped to a channel (either existing TV channel
+    or a newly created dynamic channel). No frequencies are skipped.
     """
+    global DYNAMIC_CHANNELS, NEXT_CHANNEL_NUM
+    
+    # Reset dynamic channels for this upload
+    DYNAMIC_CHANNELS = {}
+    NEXT_CHANNEL_NUM = 52
+    
     if not file.filename.lower().endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted")
 
@@ -615,18 +615,15 @@ async def upload_tvws_csv(
 
     csv_reader = csv.DictReader(io.StringIO(text_content))
 
-    # Validate that the required columns are present
     required_columns = {
         "Frequency_MHz", "Power_dBm", "File_Segment",
         "Location_Name", "GPS_Latitude", "GPS_Longitude",
         "Timestamp_UTC", "RBW_kHz", "Source_File",
     }
-    # In_TVWS_Band is optional now - we ignore it
-    first_row = None
+    
     rows = []
     for row in csv_reader:
-        if first_row is None:
-            first_row = row
+        if not rows:  # first row
             missing = required_columns - set(row.keys())
             if missing:
                 raise HTTPException(
@@ -638,11 +635,7 @@ async def upload_tvws_csv(
     if not rows:
         raise HTTPException(status_code=400, detail="CSV file is empty")
 
-    # ------------------------------------------------------------------
-    # Pass 1: group raw rows by (location_name, timestamp, file_segment)
-    # Process ALL rows - ignore In_TVWS_Band column
-    # ------------------------------------------------------------------
-    # Structure: segments[location][timestamp_iso][segment_int] = {meta, raw_readings[]}
+    # Group by location, timestamp, segment
     segments: Dict[str, Dict[str, Dict[int, Dict]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(lambda: {"meta": None, "raw": []}))
     )
@@ -650,7 +643,7 @@ async def upload_tvws_csv(
     rows_processed = 0
     tvws_rows_processed = 0
     parse_errors = 0
-    frequencies_outside_band = 0
+    unique_frequencies = set()
 
     for row in rows:
         rows_processed += 1
@@ -665,15 +658,16 @@ async def upload_tvws_csv(
             source_file = row["Source_File"].strip()
             timestamp   = datetime.fromisoformat(
                 row["Timestamp_UTC"].replace("Z", "+00:00")
-            ).replace(tzinfo=None)   # store as naive UTC in MongoDB
+            ).replace(tzinfo=None)
         except (ValueError, KeyError) as exc:
             parse_errors += 1
             continue
 
+        unique_frequencies.add(round(freq_mhz, 3))
+        
         ts_iso = timestamp.isoformat()
         bucket = segments[loc_name][ts_iso][segment]
 
-        # Store metadata once per bucket (all rows in a segment share it)
         if bucket["meta"] is None:
             bucket["meta"] = {
                 "gps_lat":     gps_lat,
@@ -684,12 +678,9 @@ async def upload_tvws_csv(
                 "location":    loc_name,
             }
 
-        # Map frequency to TV channel (skip if outside defined TV bands)
-        channel = get_channel_from_frequency(freq_mhz)
-        if channel == 0:
-            frequencies_outside_band += 1
-            continue
-
+        # Get or create channel for this frequency - NO FREQUENCY IS SKIPPED
+        channel = get_or_create_channel(freq_mhz)
+        
         tvws_rows_processed += 1
         bucket["raw"].append({
             "channel":            channel,
@@ -697,43 +688,36 @@ async def upload_tvws_csv(
             "signal_strength_dbm": power_dbm,
         })
 
-    # ------------------------------------------------------------------
-    # Pass 2: upsert state / location / measurement documents
-    # ------------------------------------------------------------------
+    # Process and save measurements
     measurements_created = 0
     measurements_skipped = 0
-    location_created     = False
-    state_created        = False
-    segments_found: List[int] = []
+    location_created = False
+    state_created = False
+    segments_found = []
 
     for loc_name, ts_map in segments.items():
         resolved_state = state_name or infer_state(loc_name)
 
-        # ---- ensure State exists ----
         if not await database.states.find_one({"name": resolved_state}):
             await database.states.insert_one({
-                "name":       resolved_state,
+                "name": resolved_state,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             })
             state_created = True
 
         for ts_iso, seg_map in ts_map.items():
-            # Collect GPS from the first segment that has metadata
-            any_meta = next(
-                (v["meta"] for v in seg_map.values() if v["meta"]), None
-            )
+            any_meta = next((v["meta"] for v in seg_map.values() if v["meta"]), None)
             if any_meta is None:
                 continue
 
-            # ---- ensure Location exists ----
             existing_loc = await database.locations.find_one(
                 {"state": resolved_state, "name": loc_name}
             )
             if not existing_loc:
-                loc_result = await database.locations.insert_one({
+                await database.locations.insert_one({
                     "state": resolved_state,
-                    "name":  loc_name,
+                    "name": loc_name,
                     "coordinates": {
                         "lat": any_meta["gps_lat"],
                         "lon": any_meta["gps_lon"],
@@ -743,26 +727,20 @@ async def upload_tvws_csv(
                 })
                 location_created = True
 
-            # ---- one Measurement per segment ----
             for segment, bucket in seg_map.items():
                 if segment not in segments_found:
                     segments_found.append(segment)
 
                 meta = bucket["meta"]
-                if meta is None:
+                if meta is None or not bucket["raw"]:
                     continue
 
-                # Skip segments with no TVWS readings (all frequencies outside TV band)
-                if not bucket["raw"]:
-                    continue
-
-                # Aggregate sub-channel readings → one entry per TV channel
+                # Aggregate readings (max power per channel)
                 channel_readings = aggregate_readings_to_channels(bucket["raw"])
 
-                # Deduplicate: skip if this (location, timestamp, segment) already exists
                 existing_meas = await database.measurements.find_one({
-                    "location":     loc_name,
-                    "timestamp":    meta["timestamp"],
+                    "location": loc_name,
+                    "timestamp": meta["timestamp"],
                     "file_segment": segment,
                 })
                 if existing_meas:
@@ -770,23 +748,21 @@ async def upload_tvws_csv(
                     continue
 
                 await database.measurements.insert_one({
-                    "state":        resolved_state,
-                    "location":     loc_name,
-                    "timestamp":    meta["timestamp"],
-                    "readings":     channel_readings,
-                    "created_at":   datetime.utcnow(),
-                    "source_file":  meta["source_file"],
+                    "state": resolved_state,
+                    "location": loc_name,
+                    "timestamp": meta["timestamp"],
+                    "readings": channel_readings,
+                    "created_at": datetime.utcnow(),
+                    "source_file": meta["source_file"],
                     "file_segment": segment,
-                    "rbw_khz":      meta["rbw_khz"],
+                    "rbw_khz": meta["rbw_khz"],
                 })
                 measurements_created += 1
 
-    # Build message with details about skipped frequencies
-    message = f"CSV file processed successfully"
+    message = f"CSV file processed successfully - ACCEPTED ALL {len(unique_frequencies)} unique frequencies"
     if parse_errors:
         message += f" ({parse_errors} rows skipped due to parse errors)"
-    if frequencies_outside_band:
-        message += f" ({frequencies_outside_band} frequencies outside TV band were skipped)"
+    message += f" (Created {len(DYNAMIC_CHANNELS)} new channels for non-standard frequencies)"
 
     return CSVUploadResponse(
         message=message,
@@ -798,11 +774,12 @@ async def upload_tvws_csv(
         rows_processed=rows_processed,
         tvws_rows_processed=tvws_rows_processed,
         segments_found=sorted(segments_found),
+        dynamic_channels_created=len(DYNAMIC_CHANNELS),
     )
 
 
 # ---------------------------------------------------------------------------
-# Measurements endpoints
+# Measurements endpoints (same as before)
 # ---------------------------------------------------------------------------
 
 @app.get("/measurements", response_model=List[Measurement])
@@ -844,15 +821,12 @@ async def get_measurement(measurement_id: str, admin_user: dict = Depends(get_ad
     return Measurement.from_mongo(measurement)
 
 
-# Additional Measurement GET endpoints
-
 @app.get("/measurements/all", response_model=List[Measurement])
 async def get_all_measurements(
     skip: int = 0,
     limit: int = 100,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get all measurements with pagination"""
     measurements = []
     cursor = database.measurements.find().sort("timestamp", -1).skip(skip).limit(limit)
     async for m in cursor:
@@ -867,7 +841,6 @@ async def get_measurements_by_location_name(
     limit: int = 50,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get measurements by location name, optionally filtered by state"""
     query = {"location": location_name}
     if state:
         query["state"] = state
@@ -883,7 +856,6 @@ async def get_measurements_by_state(
     limit: int = 100,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get all measurements for a specific state"""
     measurements = []
     async for m in database.measurements.find({"state": state_name}).sort("timestamp", -1).limit(limit):
         measurements.append(Measurement.from_mongo(m))
@@ -896,7 +868,6 @@ async def get_measurements_by_location_id(
     limit: int = 50,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get measurements by location ID"""
     if not ObjectId.is_valid(location_id):
         raise HTTPException(status_code=400, detail="Invalid location ID")
     location = await database.locations.find_one({"_id": ObjectId(location_id)})
@@ -912,56 +883,43 @@ async def get_measurements_by_location_id(
 
 @app.get("/measurements/latest/{location_name}", response_model=Optional[Measurement])
 async def get_latest_measurement(location_name: str, state: Optional[str] = None):
-    """
-    Get the latest merged TVWS measurement for a location (public endpoint).
-
-    When a location has multiple segments, this endpoint returns a synthetic
-    'merged' measurement that combines the channel readings from all segments
-    at the most recent timestamp, giving a full picture of spectrum occupancy.
-    """
     query = {"location": location_name}
     if state:
         query["state"] = state
 
-    # Find the latest timestamp for this location
     latest = await database.measurements.find_one(query, sort=[("timestamp", -1)])
     if not latest:
         raise HTTPException(status_code=404, detail="No measurements found for this location")
 
     latest_ts = latest["timestamp"]
 
-    # Collect all segments at that timestamp
     all_readings: Dict[int, Dict] = {}
-    async for m in database.measurements.find(
-        {**query, "timestamp": latest_ts}
-    ):
+    async for m in database.measurements.find({**query, "timestamp": latest_ts}):
         for reading in m["readings"]:
             ch = reading["channel"]
-            # If channel appears in multiple segments, keep the worst-case (highest power)
             if ch not in all_readings or reading["signal_strength_dbm"] > all_readings[ch]["signal_strength_dbm"]:
                 all_readings[ch] = reading
 
     merged = latest.copy()
     merged["readings"] = sorted(all_readings.values(), key=lambda r: r["channel"])
-    merged["file_segment"] = None   # merged across segments
+    merged["file_segment"] = None
 
     return Measurement.from_mongo(merged)
 
 
 @app.get("/measurements/summary/{state_name}", response_model=Dict)
 async def get_state_summary(state_name: str, admin_user: dict = Depends(get_admin_user)):
-    """Get summary statistics for a state"""
-    total_measurements   = 0
-    unique_locations     = set()
-    total_free_channels  = 0
-    total_occupied       = 0
-    channel_stats        = defaultdict(lambda: {"free": 0, "occupied": 0, "total": 0})
+    total_measurements = 0
+    unique_locations = set()
+    total_free_channels = 0
+    total_occupied = 0
+    channel_stats = defaultdict(lambda: {"free": 0, "occupied": 0, "total": 0})
 
     async for m in database.measurements.find({"state": state_name}):
         total_measurements += 1
         unique_locations.add(m["location"])
         for reading in m["readings"]:
-            ch     = reading.get("channel", 0)
+            ch = reading.get("channel", 0)
             status = reading.get("status", "unknown")
             channel_stats[ch]["total"] += 1
             if status == "free":
@@ -974,21 +932,21 @@ async def get_state_summary(state_name: str, admin_user: dict = Depends(get_admi
     locations = []
     async for loc in database.locations.find({"state": state_name}):
         locations.append({
-            "id":          str(loc["_id"]),
-            "name":        loc["name"],
+            "id": str(loc["_id"]),
+            "name": loc["name"],
             "coordinates": loc["coordinates"],
         })
 
     return {
-        "state":              state_name,
+        "state": state_name,
         "total_measurements": total_measurements,
-        "unique_locations":   len(unique_locations),
-        "locations":          locations,
+        "unique_locations": len(unique_locations),
+        "locations": locations,
         "channel_statistics": {str(ch): stats for ch, stats in channel_stats.items()},
         "summary": {
-            "total_free_channel_readings":     total_free_channels,
+            "total_free_channel_readings": total_free_channels,
             "total_occupied_channel_readings": total_occupied,
-            "average_free_per_measurement":    (
+            "average_free_per_measurement": (
                 total_free_channels / total_measurements if total_measurements else 0
             ),
         },
@@ -1003,10 +961,9 @@ async def get_measurements_by_date_range(
     location: Optional[str] = None,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get measurements within a date range"""
     try:
         start = datetime.fromisoformat(start_date.replace('Z', '+00:00')).replace(tzinfo=None)
-        end   = datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=None)
+        end = datetime.fromisoformat(end_date.replace('Z', '+00:00')).replace(tzinfo=None)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use ISO format (YYYY-MM-DDTHH:MM:SSZ)")
 
@@ -1028,7 +985,6 @@ async def get_free_channels_stats(
     location: Optional[str] = None,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get statistics about free channels across measurements"""
     query: Dict = {}
     if state:
         query["state"] = state
@@ -1040,8 +996,8 @@ async def get_free_channels_stats(
         {"$unwind": "$readings"},
         {"$match": {"readings.status": "free"}},
         {"$group": {
-            "_id":        {"channel": "$readings.channel", "frequency": "$readings.frequency_mhz"},
-            "count":      {"$sum": 1},
+            "_id": {"channel": "$readings.channel", "frequency": "$readings.frequency_mhz"},
+            "count": {"$sum": 1},
             "avg_signal": {"$avg": "$readings.signal_strength_dbm"},
         }},
         {"$sort": {"_id.channel": 1}},
@@ -1050,16 +1006,16 @@ async def get_free_channels_stats(
     results = []
     async for doc in database.measurements.aggregate(pipeline):
         results.append({
-            "channel":          doc["_id"]["channel"],
-            "frequency_mhz":    doc["_id"]["frequency"],
-            "times_free":       doc["count"],
+            "channel": doc["_id"]["channel"],
+            "frequency_mhz": doc["_id"]["frequency"],
+            "times_free": doc["count"],
             "average_signal_dbm": round(doc["avg_signal"], 2),
         })
 
     return {
         "total_free_channel_occurrences": sum(r["times_free"] for r in results),
-        "unique_free_channels":           len(results),
-        "channels":                       results,
+        "unique_free_channels": len(results),
+        "channels": results,
     }
 
 
@@ -1070,7 +1026,6 @@ async def export_measurements(
     format: str = "json",
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Export measurements for a location in JSON or CSV format"""
     query = {"location": location_name}
     if state:
         query["state"] = state
@@ -1078,14 +1033,14 @@ async def export_measurements(
     measurements = []
     async for m in database.measurements.find(query).sort("timestamp", -1):
         measurements.append({
-            "id":           str(m["_id"]),
-            "state":        m["state"],
-            "location":     m["location"],
-            "timestamp":    m["timestamp"].isoformat(),
+            "id": str(m["_id"]),
+            "state": m["state"],
+            "location": m["location"],
+            "timestamp": m["timestamp"].isoformat(),
             "file_segment": m.get("file_segment"),
-            "rbw_khz":      m.get("rbw_khz"),
-            "readings":     m["readings"],
-            "created_at":   m.get("created_at", m["timestamp"]).isoformat(),
+            "rbw_khz": m.get("rbw_khz"),
+            "readings": m["readings"],
+            "created_at": m.get("created_at", m["timestamp"]).isoformat(),
         })
 
     if format == "csv":
@@ -1107,10 +1062,10 @@ async def export_measurements(
         return {"csv_data": output.getvalue()}
 
     return {
-        "location":          location_name,
-        "state":             state or "all",
+        "location": location_name,
+        "state": state or "all",
         "total_measurements": len(measurements),
-        "measurements":      measurements,
+        "measurements": measurements,
     }
 
 
@@ -1129,10 +1084,10 @@ async def update_measurement(
     if "readings" in update_data:
         update_data["readings"] = [
             {
-                "channel":            r["channel"],
-                "frequency_mhz":      r["frequency_mhz"],
+                "channel": r["channel"],
+                "frequency_mhz": r["frequency_mhz"],
                 "signal_strength_dbm": r["signal_strength_dbm"],
-                "status":             "free" if r["signal_strength_dbm"] < TVWS_FREE_THRESHOLD_DBM else "occupied",
+                "status": "free" if r["signal_strength_dbm"] < TVWS_FREE_THRESHOLD_DBM else "occupied",
             }
             for r in update_data["readings"]
         ]
@@ -1152,29 +1107,21 @@ async def delete_measurement(measurement_id: str, admin_user: dict = Depends(get
 
 
 # ---------------------------------------------------------------------------
-# TVWS Query endpoint
+# TVWS Query endpoint (updated to handle dynamic channels)
 # ---------------------------------------------------------------------------
 
 @app.post("/query-tvws", response_model=QueryResponse)
 async def query_tvws(query: QueryRequest):
-    """
-    Query TVWS channel availability at a specific location and time.
-
-    Returns a merged view across all segments recorded at or before the
-    requested time, giving a complete channel availability picture.
-    """
     location = await database.locations.find_one({"state": query.state, "name": query.location})
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
 
-    # Find the latest timestamp at or before query time
     latest = await database.measurements.find_one(
         {"state": query.state, "location": query.location, "timestamp": {"$lte": query.time}},
         sort=[("timestamp", -1)]
     )
 
     if not latest:
-        # No data — return all channels as unknown
         channels = [
             ChannelReading(
                 channel=ch,
@@ -1193,7 +1140,6 @@ async def query_tvws(query: QueryRequest):
 
     latest_ts = latest["timestamp"]
 
-    # Merge all segments at that timestamp (worst-case per channel)
     merged: Dict[int, Dict] = {}
     async for m in database.measurements.find(
         {"state": query.state, "location": query.location, "timestamp": latest_ts}
@@ -1204,11 +1150,11 @@ async def query_tvws(query: QueryRequest):
                 merged[ch] = reading
 
     channel_list = sorted(merged.values(), key=lambda r: r["channel"])
-    free_count   = sum(1 for r in channel_list if r.get("status") == "free")
+    free_count = sum(1 for r in channel_list if r.get("status") == "free")
 
     return QueryResponse(
         channels=channel_list,
-        totalAvailableBandwidth=float(free_count * 8),   # 8 MHz per channel
+        totalAvailableBandwidth=float(free_count * 8),
         location=Location(**location),
         queryTime=query.time
     )
@@ -1220,11 +1166,12 @@ async def query_tvws(query: QueryRequest):
 
 @app.get("/tvws-channels")
 async def get_tvws_channels():
-    """List all defined TVWS channels with their center frequencies."""
+    """List all defined TVWS channels (including dynamically created ones)."""
     return {
-        "channels":      [{"channel": ch, "frequency_mhz": freq} for ch, freq in TVWS_CHANNELS.items()],
+        "channels": [{"channel": ch, "frequency_mhz": freq} for ch, freq in sorted(TVWS_CHANNELS.items())],
         "bandwidth_mhz": 8,
         "total_channels": len(TVWS_CHANNELS),
+        "dynamic_channels": len(DYNAMIC_CHANNELS),
     }
 
 
@@ -1235,7 +1182,6 @@ async def get_measurements_by_location(
     limit: int = 10,
     admin_user: dict = Depends(get_admin_user)
 ):
-    """Get measurements for a specific state/location combination."""
     measurements = []
     async for m in database.measurements.find(
         {"state": state, "location": location}
