@@ -1116,8 +1116,18 @@ async def query_tvws(query: QueryRequest):
     if not location:
         raise HTTPException(status_code=404, detail="Location not found")
 
+    # DB stores timestamps as naive UTC datetimes.
+    # Normalize incoming (may be timezone-aware) query.time into naive UTC
+    # so Mongo's "$lte" comparison works reliably.
+    query_time = query.time
+    if getattr(query_time, "tzinfo", None) is not None:
+        query_time = query_time.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        # Assume it's already UTC-naive
+        query_time = query_time.replace(tzinfo=None)
+
     latest = await database.measurements.find_one(
-        {"state": query.state, "location": query.location, "timestamp": {"$lte": query.time}},
+        {"state": query.state, "location": query.location, "timestamp": {"$lte": query_time}},
         sort=[("timestamp", -1)]
     )
 
